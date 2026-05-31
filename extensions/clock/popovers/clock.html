@@ -7,19 +7,18 @@
         /* Fall back gracefully if the host hasn't injected its theme vars. */
         --text: var(--muxy-text, rgba(0, 0, 0, 0.9));
         --muted: var(--muxy-text-muted, rgba(0, 0, 0, 0.5));
-        --surface: var(--muxy-surface, rgba(0, 0, 0, 0.06));
       }
       @media (prefers-color-scheme: dark) {
         :root {
           --text: var(--muxy-text, rgba(255, 255, 255, 0.92));
           --muted: var(--muxy-text-muted, rgba(255, 255, 255, 0.55));
-          --surface: var(--muxy-surface, rgba(255, 255, 255, 0.08));
         }
       }
 
       html,
       body {
         margin: 0;
+        height: 100%;
         /* Let the native popover material show through. */
         background: transparent;
       }
@@ -28,15 +27,18 @@
         color: var(--text);
         -webkit-user-select: none;
         user-select: none;
+        /* Fill the whole popover so no empty body shows through as a second band. */
+        display: flex;
       }
       .card {
-        display: inline-flex;
+        display: flex;
+        flex: 1;
         flex-direction: column;
         align-items: center;
+        justify-content: center;
         gap: 4px;
         padding: 18px 28px;
-        border-radius: 12px;
-        background: var(--surface);
+        box-sizing: border-box;
       }
       #time {
         font-size: 40px;

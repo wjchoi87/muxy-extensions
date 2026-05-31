@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/muxy-app/muxy/main/docs/extensions/schema/manifest.schema.json",
   "name": "clock",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A status bar clock. Click it to open a popover with a live, theme-aware clock.",
   "permissions": ["panels:write"],
   "popovers": [
