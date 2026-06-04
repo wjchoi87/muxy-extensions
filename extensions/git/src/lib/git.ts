@@ -102,6 +102,15 @@ export async function try_action(action: () => Promise<unknown>, error_title: st
   }
 }
 
+export async function git_output(
+  cwd: string | undefined,
+  args: string[],
+): Promise<string | null> {
+  const res = await muxy.exec(["git", ...args], { cwd }).catch(() => null);
+  if (!res || res.exitCode !== 0) return null;
+  return (res.stdout ?? "").trim();
+}
+
 export async function exec_git(
   cwd: string | undefined,
   args: string[],

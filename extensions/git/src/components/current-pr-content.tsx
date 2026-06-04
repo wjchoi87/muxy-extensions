@@ -1,12 +1,17 @@
+import { useState } from "react";
 import { ExternalLink, GitMerge, Loader2, Trash2, XCircle } from "lucide-react";
-import { confirm_action, open_url } from "@/lib/git";
+import { open_url } from "@/lib/git";
 import { pr_state, type MergeMethod } from "@/lib/git-prs";
 import { PrStateIcon } from "./pr-state-icon";
+import { InlineConfirm } from "./inline-confirm";
 
 export type PrAction = MergeMethod | "close" | "cleanup";
 
 interface CurrentPrContentProps {
   pr: MuxyGitPR;
+  branch: string | null;
+  defaultBranch: string | null;
+  dirty: boolean;
   pending: PrAction | null;
   refreshing?: boolean;
   onMerge: (method: MergeMethod, deleteBranch: boolean) => Promise<boolean>;
@@ -17,6 +22,9 @@ interface CurrentPrContentProps {
 
 export function CurrentPrContent({
   pr,
+  branch,
+  defaultBranch,
+  dirty,
   pending,
   refreshing,
   onMerge,
@@ -24,21 +32,18 @@ export function CurrentPrContent({
   onCleanup,
   onDone,
 }: CurrentPrContentProps) {
+  const [confirming, set_confirming] = useState<"close" | "cleanup" | null>(null);
   const busy = pending !== null;
 
   async function run(action: Promise<boolean>) {
+    set_confirming(null);
     const ok = await action;
     if (ok) onDone?.();
   }
 
-  async function confirm_close() {
-    const ok = await confirm_action({
-      title: `Close PR #${pr.number}?`,
-      message: `This closes pull request #${pr.number} without merging it.`,
-      confirmLabel: "Close PR",
-    });
-    if (ok) void run(onClose(pr.number));
-  }
+  const cleanupMessage = `This switches to ${defaultBranch ?? "the default branch"} and deletes branch "${
+    branch ?? ""
+  }".${dirty ? " Uncommitted changes will no longer belong to any branch." : ""}`;
 
   return (
     <div className="flex flex-col gap-2">
@@ -56,14 +61,14 @@ export function CurrentPrContent({
             disabled={busy || pr_state(pr) !== "open"}
             loading={pending === "close"}
             tone="danger"
-            onClick={() => void confirm_close()}
+            onClick={() => set_confirming("close")}
           />
           <IconAction
             icon={Trash2}
             title="Clean up branch"
-            disabled={busy}
+            disabled={busy || !branch}
             loading={pending === "cleanup"}
-            onClick={() => void run(onCleanup())}
+            onClick={() => set_confirming("cleanup")}
           />
           <IconAction icon={ExternalLink} title="View on GitHub" onClick={() => open_url(pr.url)} />
         </div>
@@ -72,7 +77,27 @@ export function CurrentPrContent({
       <Row label="Mergeable" value={mergeable_label(pr)} tone={mergeable_tone(pr)} />
       <ChecksRow checks={pr.checks} />
 
-      <Actions pr={pr} pending={pending} onMerge={(method) => void run(onMerge(method, true))} />
+      {confirming === "close" ? (
+        <InlineConfirm
+          message={`Close pull request #${pr.number} without merging it.`}
+          confirmLabel="Close PR"
+          tone="danger"
+          loading={pending === "close"}
+          onConfirm={() => void run(onClose(pr.number))}
+          onCancel={() => set_confirming(null)}
+        />
+      ) : confirming === "cleanup" ? (
+        <InlineConfirm
+          message={cleanupMessage}
+          confirmLabel="Clean Up"
+          tone="danger"
+          loading={pending === "cleanup"}
+          onConfirm={() => void run(onCleanup())}
+          onCancel={() => set_confirming(null)}
+        />
+      ) : (
+        <Actions pr={pr} pending={pending} onMerge={(method) => void run(onMerge(method, true))} />
+      )}
     </div>
   );
 }
@@ -187,14 +212,14 @@ function MergeButton({
 }
 
 function ChecksRow({ checks }: { checks: MuxyGitPRChecks }) {
-  if (checks.status === "none") return <Row label="Checks" value="—" />;
+  if (checks.status === "none" && checks.total === 0) return <Row label="Checks" value="—" />;
   const parts = [
     checks.passing > 0 && `${checks.passing} passing`,
     checks.failing > 0 && `${checks.failing} failing`,
     checks.pending > 0 && `${checks.pending} running`,
   ].filter(Boolean) as string[];
   const tone: Tone =
-    checks.status === "failure" ? "negative" : checks.status === "success" ? "positive" : "default";
+    checks.failing > 0 ? "negative" : checks.pending > 0 ? "default" : checks.passing > 0 ? "positive" : "default";
   return <Row label="Checks" value={parts.join(" · ") || "—"} tone={tone} />;
 }
 
@@ -238,8 +263,8 @@ function mergeable_label(pr: MuxyGitPR): string {
     default:
       break;
   }
-  if (pr.checks.status === "failure") return "Yes (checks failing)";
-  if (pr.checks.status === "pending") return "Yes (checks running)";
+  if (pr.checks.failing > 0) return "Yes (checks failing)";
+  if (pr.checks.pending > 0) return "Yes (checks running)";
   return "Yes";
 }
 
@@ -255,6 +280,6 @@ function mergeable_tone(pr: MuxyGitPR): Tone {
     default:
       break;
   }
-  if (pr.checks.status === "failure") return "negative";
+  if (pr.checks.failing > 0) return "negative";
   return "positive";
 }

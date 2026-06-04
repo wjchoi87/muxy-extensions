@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { GitPullRequest, Loader2 } from "lucide-react";
 import { alert_error } from "@/lib/git";
 import { cleanup_branch, remove_worktree_or_branch } from "@/lib/git-cleanup";
-import { merge_pr, close_pr, type MergeMethod } from "@/lib/git-prs";
+import { merge_pr, close_pr, fetch_resolved_status, type MergeMethod } from "@/lib/git-prs";
 import { read_pr_cache, write_pr_cache, clear_pr_cache } from "@/lib/pr-cache";
 import { CurrentPrContent, type PrAction } from "@/components/current-pr-content";
 
@@ -22,7 +22,7 @@ export function PrInfoPanel() {
 
     set_refreshing(true);
     try {
-      const s = await muxy.git.status();
+      const s = await fetch_resolved_status();
       if (s.pullRequest) {
         const info = {
           pr: s.pullRequest,
@@ -57,6 +57,12 @@ export function PrInfoPanel() {
     set_pending(method);
     try {
       await merge_pr(number, method, false);
+    } catch (err) {
+      await alert_error(`Could not merge PR #${number}`, err);
+      set_pending(null);
+      return false;
+    }
+    try {
       if (deleteBranch && state.kind === "ready") {
         await remove_worktree_or_branch({
           branch: state.branch,
@@ -64,14 +70,13 @@ export function PrInfoPanel() {
           dirty: false,
         });
       }
-      await clear_pr_cache();
-      return true;
     } catch (err) {
-      await alert_error(`Could not merge PR #${number}`, err);
-      return false;
+      await alert_error(`PR #${number} merged, but branch cleanup failed`, err);
     } finally {
+      await clear_pr_cache();
       set_pending(null);
     }
+    return true;
   }, [state]);
 
   const close = useCallback(async (number: number) => {
@@ -119,6 +124,9 @@ export function PrInfoPanel() {
       ) : (
         <CurrentPrContent
           pr={state.pr}
+          branch={state.branch}
+          defaultBranch={state.defaultBranch}
+          dirty={state.dirty}
           pending={pending}
           refreshing={refreshing}
           onMerge={(method, deleteBranch) => merge(state.pr.number, method, deleteBranch)}

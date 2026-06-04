@@ -5,6 +5,26 @@ export function pr_state(pr: { state: string }): "open" | "closed" | "merged" {
   return "open";
 }
 
+const RESOLVE_RETRIES = 3;
+const RESOLVE_DELAY_MS = 1200;
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function is_resolved(pr: MuxyGitPR): boolean {
+  if (pr_state(pr) !== "open") return true;
+  return pr.mergeable !== null && pr.checks.status !== "pending";
+}
+
+export async function fetch_resolved_status(): Promise<MuxyGitStatus> {
+  let status = await muxy.git.status();
+  for (let i = 0; i < RESOLVE_RETRIES; i++) {
+    if (!status.pullRequest || is_resolved(status.pullRequest)) break;
+    await delay(RESOLVE_DELAY_MS);
+    status = await muxy.git.status();
+  }
+  return status;
+}
+
 export type MergeMethod = "merge" | "squash" | "rebase";
 
 export function merge_pr(
