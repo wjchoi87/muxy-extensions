@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -67,6 +67,10 @@ jobs:
           else
             before="$BEFORE_SHA"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="HEAD~1"
+            fi
+            if ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+              echo "::warning::before ref '$before' is not available; falling back to HEAD~1"
               before="HEAD~1"
             fi
             raw="$(git diff --name-only "$before" "$AFTER_SHA" -- extensions/ \
