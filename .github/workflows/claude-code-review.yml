@@ -1,0 +1,79 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review this Muxy extension PR: ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+            Muxy extensions are npm + Vite projects. The manifest is the "muxy" key in
+            package.json; source lives in src/ and builds to dist/. Read the extension's
+            package.json and the muxy-extension skill guidance before judging.
+
+            Evaluate ONLY these checks, each as a single pass/fail line:
+
+            1. Safe — does nothing harmful to the user's computer (no destructive shell/fs
+               commands, no exfiltration, no network calls to unexpected hosts) AND declares
+               only the permissions it actually uses (least privilege).
+            2. Quality — lightweight and well-built: no heavy/needless deps, no dead or
+               duplicated code, has a build script, no hardcoded ~/.config/muxy paths.
+            3. Design — follows Muxy guidelines: colors are var(--muxy-*) (no hex chrome),
+               spacing/font/icon/radius values come from the Muxy scale, icons weight 600.
+            4. New vs Update — state which it is. If an update, confirm the version was bumped.
+               If new, confirm it has the required manifest fields.
+            5. Naming — the extension name is simple kebab-case with NO "muxy-" or
+               "extension-" prefix, and screenshots follow the standard naming convention.
+
+            Then post EXACTLY ONE PR comment (use gh) in this format — nothing else, no prose,
+            no inline comments. Keep each line to one short sentence:
+
+            **Extension review** — <New extension | Update vX.Y.Z>
+
+            - [x] Safe — <one-line reason>
+            - [ ] Quality — <one-line reason it failed, or "looks good">
+            - [x] Design — <one-line reason>
+            - [x] Naming — <one-line reason>
+
+            <one short overall line: ✅ ready to merge / ⚠️ needs changes>
+
+            Use [x] for pass and [ ] for fail. Omit the "New vs Update" row from the
+            checkbox list since it's already in the header. Be terse — the whole comment
+            should fit in a few lines.
+          # Tools Claude may run during the review (post a comment; inspect the PR):
+          claude_args: '--allowed-tools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Glob,Grep"'
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+
