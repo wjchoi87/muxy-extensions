@@ -87,9 +87,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The base commit may not exist in a fork clone; fetch it so the diff
-          # has a merge base. Falls back to the recorded base ref name.
-          git fetch --no-tags --depth=1 \
+          # The base commit may not exist in a fork clone; fetch enough history
+          # for a real merge base so the diff isolates this PR's own changes.
+          # Falls back to the recorded base ref name.
+          git fetch --no-tags --depth=50 \
             "https://github.com/${{ github.repository }}.git" "$BASE_SHA" 2>/dev/null || true
           if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
             base="$BASE_SHA"
@@ -98,8 +99,19 @@ jobs:
             base="origin/${{ github.event.pull_request.base.ref }}"
           fi
 
+          # Diff against the MERGE BASE, not the base tip: a two-dot diff
+          # ("$base" "$HEAD_SHA") would also report extensions that landed on the
+          # base branch after this PR forked, spuriously failing the one-extension
+          # gate. The merge base counts only what this PR itself changed.
+          if mb="$(git merge-base "$base" "$HEAD_SHA" 2>/dev/null)"; then
+            diff_base="$mb"
+          else
+            echo "::warning::no merge base for $base..$HEAD_SHA; comparing against the base tip directly."
+            diff_base="$base"
+          fi
+
           # Extensions whose files changed in this PR (top-level dir name).
-          changed="$(git diff --name-only "$base" "$HEAD_SHA" -- extensions/ \
+          changed="$(git diff --name-only "$diff_base" "$HEAD_SHA" -- extensions/ \
             | awk -F/ 'NF>1 && $1=="extensions" {print $2}' \
             | sort -u)"
           count="$(printf '%s' "$changed" | grep -c . || true)"
