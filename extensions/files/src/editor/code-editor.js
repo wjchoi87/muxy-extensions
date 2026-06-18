@@ -566,6 +566,17 @@ export class CodeEditor {
     });
   }
 
+  gotoLine(lineNumber) {
+    if (!this.view) return;
+    const num = Number(lineNumber);
+    if (!Number.isFinite(num)) return;
+    const line = this.view.state.doc.line(Math.max(1, Math.min(num, this.view.state.doc.lines)));
+    this.view.dispatch({
+      selection: { anchor: line.from },
+      scrollIntoView: true,
+    });
+  }
+
   destroy() {
     if (this.cursorSaveTimer) {
       window.clearTimeout(this.cursorSaveTimer);

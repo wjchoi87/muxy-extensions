@@ -4,6 +4,7 @@ import { icon_for } from "@/lib/file-icon";
 import { CodeEditor } from "@/editor/code-editor";
 import { MarkdownEditor } from "@/editor/markdown-editor";
 import { ImageViewer } from "@/editor/image-viewer";
+import { FindInFilesView } from "@/editor/find-in-files";
 import { SettingsSheet } from "@/editor/settings-sheet";
 import { OpenIcon, RevealIcon, SaveIcon, SettingsIcon } from "@/editor/icons";
 import {
@@ -182,6 +183,10 @@ export class EditorApp {
     return this.data.replaceable !== false;
   }
 
+  get searchMode() {
+    return this.data.searchMode === true;
+  }
+
   isMarkdown() {
     return this.filePath ? is_markdown(this.filePath) : false;
   }
@@ -243,11 +248,21 @@ export class EditorApp {
       if (this.fileLoadId === loadId) {
         this.loading = false;
         this.render();
+        if (this.data?.line && this.child?.gotoLine) {
+          const lineNumber = this.data.line;
+          delete this.data.line;
+          requestAnimationFrame(() => this.child?.gotoLine?.(lineNumber));
+        }
       }
     }
   }
 
   updateTabChrome() {
+    if (this.searchMode) {
+      void muxy.tabs.setTitle("Find in Files");
+      void muxy.tabs.setIcon({ symbol: "magnifyingglass" });
+      return;
+    }
     if (!this.filePath) {
       void muxy.tabs.setTitle("");
       void muxy.tabs.setIcon(null);
@@ -342,6 +357,10 @@ export class EditorApp {
     if (!filePath) {
       this.destroyChild();
       this.destroySettings();
+      if (this.searchMode) {
+        this.renderFindInFiles();
+        return;
+      }
       this.shell = null;
       this.shellFilePath = null;
       this.root.replaceChildren(h("div", { class: "editor" }, h("div", { class: "editor-empty" }, "No file open")));
@@ -365,7 +384,14 @@ export class EditorApp {
   }
 
   updateTopbar() {
-    if (!this.topbar || !this.filePath) return;
+    if (!this.topbar) return;
+    if (this.searchMode) {
+      clear(this.topbar);
+      const title = h("div", { class: "editor-title" }, h("span", { class: "editor-name" }, "Find in Files"));
+      this.topbar.appendChild(title);
+      return;
+    }
+    if (!this.filePath) return;
     const markdown = this.isMarkdown();
     const image = this.isImage();
     const svg = this.isSvg();
@@ -501,6 +527,28 @@ export class EditorApp {
     }
 
     this.topbar.append(title, actions);
+  }
+
+  renderFindInFiles() {
+    if (!this.shell || this.shellFilePath !== null) {
+      this.destroyChild();
+      this.destroySettings();
+      this.shellFilePath = null;
+      this.bodyKey = null;
+      this.topbar = h("div", { class: "topbar" });
+      this.body = h("div", { class: "editor-body" });
+      this.shell = h("div", { class: "editor" }, this.topbar, this.body);
+      this.root.replaceChildren(this.shell);
+    }
+    this.updateTopbar();
+    this.renderFindInFilesBody();
+  }
+
+  renderFindInFilesBody() {
+    if (!this.body) return;
+    this.destroyChild();
+    this.bodyKey = "find-in-files";
+    this.child = new FindInFilesView({ parent: this.body });
   }
 
   renderBody() {
