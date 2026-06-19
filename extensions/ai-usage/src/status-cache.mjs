@@ -8,6 +8,11 @@ export function statusCachePayload(snapshots, preferences) {
     version: 1,
     displayMode: preferences.displayMode,
     pinnedPreview: preferences.pinnedPreview,
+    autoRefreshSeconds: preferences.autoRefreshSeconds,
+    // Popover heartbeat: background uses this to detect if popover is active
+    popoverHeartbeat: Date.now(),
+    // Store tracked provider IDs so background can skip untracked (hidden) providers
+    trackedProviderIDs: preferences.trackedProviderIDs ? [...preferences.trackedProviderIDs] : [],
     snapshots: serialized.snapshots
   });
 }
