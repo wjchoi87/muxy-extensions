@@ -4,6 +4,8 @@ import { providerCatalog } from "./providers.mjs";
 import { statusCachePath } from "./status-cache.mjs";
 
 try {
+  muxy.events.subscribe("extension.ai-usage.keepalive", () => {});
+
   const home = readHome();
   const startMs = Date.now();
 
@@ -100,7 +102,11 @@ try {
   if (cachePayload && Array.isArray(cachePayload.snapshots) && cachePayload.snapshots.length > 0) {
     poll();
   }
-  setInterval(poll, autoRefreshSeconds * 1000);
+  if (typeof setInterval === "function") {
+    setInterval(poll, autoRefreshSeconds * 1000);
+  } else {
+    console.warn("ai-usage background polling timer unavailable");
+  }
 
   console.log(`ai-usage background polling started (interval=${autoRefreshSeconds}s, elapsed=${Date.now() - startMs}ms)`);
 } catch (error) {
