@@ -1,6 +1,7 @@
 import { parseCodexRows, parseKimiRows, parseOpenCodeGoRows, parseGrokRows, parseFactoryRows, parseClaudeRows } from "./live-parsers.mjs";
 import { parseJSON, formatPlanName } from "./live-runtime.mjs";
 import { providerCatalog } from "./providers.mjs";
+import { statusCachePath } from "./status-cache.mjs";
 
 try {
   const home = readHome();
@@ -10,7 +11,7 @@ try {
   let autoRefreshSeconds = 300;
   let cachePayload = null;
   try {
-    cachePayload = readCache(home);
+    cachePayload = readCache();
     if (cachePayload) {
       autoRefreshSeconds = cachePayload.autoRefreshSeconds || 300;
       const presentation = statusBarPresentation(cachePayload);
@@ -31,7 +32,7 @@ try {
   function poll() {
     try {
       const nowMs = Date.now();
-      const payload = readCache(home);
+      const payload = readCache();
 
       // No cache yet — nothing to refresh
       if (!payload || !Array.isArray(payload.snapshots)) return;
@@ -75,10 +76,10 @@ try {
       });
 
       // Write atomically: temp → rename
-      const tmpPath = `${cacheDir(home)}/status-cache.json.tmp`;
+      const tmpPath = `${statusCachePath}.tmp`;
       const tee = muxy.exec(["/usr/bin/tee", tmpPath], { stdin: newPayload, timeoutMs: 3000 });
       if (tee && tee.exitCode === 0) {
-        muxy.exec(["/bin/mv", "-f", tmpPath, cachePath(home)], { timeoutMs: 3000 });
+        muxy.exec(["/bin/mv", "-f", tmpPath, statusCachePath], { timeoutMs: 3000 });
       }
 
       // Update status bar
@@ -110,15 +111,8 @@ try {
 //  Helpers
 // ═══════════════════════════════════════════════════
 
-function cacheDir(home) {
-  return `${home}/.config/muxy/extensions/ai-usage`;
-}
-function cachePath(home) {
-  return `${cacheDir(home)}/status-cache.json`;
-}
-
-function readCache(home) {
-  const result = muxy.exec(["/bin/cat", cachePath(home)], { timeoutMs: 3000 });
+function readCache() {
+  const result = muxy.exec(["/bin/cat", statusCachePath], { timeoutMs: 3000 });
   if (!result || result.exitCode !== 0) return null;
   const trimmed = String(result.stdout || "").trim();
   if (!trimmed) return null;

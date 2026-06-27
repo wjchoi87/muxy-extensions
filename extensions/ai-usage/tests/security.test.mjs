@@ -18,10 +18,13 @@ test("security: popover exec commands use absolute binaries", async () => {
 test("regression: background restores the cached status bar text on activation", async () => {
   const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const background = await readFile(new URL("../src/background.mjs", import.meta.url), "utf8");
+  const cacheSource = await readFile(new URL("../src/status-cache.mjs", import.meta.url), "utf8");
+  const cacheCode = `${background}\n${cacheSource}`;
 
   assert.equal(manifest.muxy.background, "background.js");
-  assert.match(background, /status-cache\.json/);
+  assert.match(cacheCode, /status-cache\.json/);
   assert.match(background, /muxy\.statusbar\.set/);
+  assert.doesNotMatch(cacheCode, /\.config\/muxy\/extensions\/ai-usage/);
   assert.doesNotMatch(background, /async/);
   assert.doesNotMatch(background, /await/);
   // setInterval은 polling loop에서 의도적으로 사용됨
