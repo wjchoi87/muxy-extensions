@@ -23,6 +23,7 @@ import { FOLDER_PATHS, icon_paths_for } from "@/lib/file-icon";
 import { load_icon_theme, save_icon_theme, subscribe_icon_theme } from "@/lib/icon-theme";
 import { load_tree_memory, save_tree_memory } from "@/lib/tree-memory";
 import { GitStatusStore } from "@/lib/git-status";
+import { OpenTabsStore } from "@/lib/open-tabs";
 
 const RECONCILE_DEBOUNCE_MS = 250;
 
@@ -52,6 +53,13 @@ const GIT_STATUS_GLYPH = {
 
 function is_dir(path) {
   return path === "" || path.endsWith("/");
+}
+
+// panel.opened payloads aren't strongly documented; accept the common shapes.
+function panel_id_of(payload) {
+  if (typeof payload === "string") return payload;
+  if (payload && typeof payload === "object") return payload.panel ?? payload.id ?? payload.panelId ?? null;
+  return null;
 }
 
 function block_ends_within(dirSegs, pathSegs, maxEnd) {
@@ -84,8 +92,6 @@ function chevron_icon(expanded) {
   return icon_svg([{ d: expanded ? "M6 9l6 6 6-6" : "M9 6l6 6-6 6" }]);
 }
 
-// Nesting depth of a relative path, used to restore expanded dirs parent-first.
-// Directory rels carry a trailing slash, so trim it before counting separators.
 function depth_of(rel) {
   const trimmed = rel.endsWith("/") ? rel.slice(0, -1) : rel;
   return trimmed ? trimmed.split("/").length : 0;
@@ -153,6 +159,7 @@ export class FilesPanelApp {
     this.loadedDirs = new Set();
     this.expandedDirs = new Set();
     this.selectedPath = null;
+    this.worktreeRoot = null;
     this.dropTarget = null;
     this.renameState = null;
     this.pendingDirs = new Set();
@@ -161,8 +168,16 @@ export class FilesPanelApp {
     this.contextDisposers = [];
     this.disposers = [];
     this.gitStatus = new GitStatusStore();
+    this.openTabs = new OpenTabsStore();
     this.dirtyFilter = false;
     this.iconTheme = load_icon_theme();
+    // Keyboard navigation: `visiblePaths` is the rendered rows in display
+    // order, `rowElements` maps each path to its row node so selection can be
+    // updated without a full re-render.
+    this.visiblePaths = [];
+    this.rowElements = new Map();
+    this.typeahead = { buffer: "", timer: null };
+    this.didInitialFocus = false;
 
     this.ops = {
       createFile: (parentRel = "") => this.createFile(parentRel),
@@ -173,9 +188,14 @@ export class FilesPanelApp {
       reveal: (rel) => reveal_in_finder(rel),
       openExternally: (rel) => open_externally(rel),
       copyPath: (rel) => copy_path(rel),
-      openInEditor: (rel) => open_in_editor(rel),
+      openInEditor: (rel) => this.openFile(rel),
       refresh: () => this.loadRoot(),
     };
+  }
+
+  async openFile(rel) {
+    const tabId = await this.openTabs.resolveTabId(rel);
+    return open_in_editor(rel, tabId);
   }
 
   start() {
@@ -186,6 +206,13 @@ export class FilesPanelApp {
     this.list = h("div", {
       class: "file-tree-list",
       role: "tree",
+      // Focusable so the tree can be driven entirely from the keyboard. The
+      // active row is tracked via aria-activedescendant while DOM focus stays
+      // on this container (which survives the full re-render on each change).
+      tabindex: 0,
+      "aria-label": "File tree",
+      onKeyDown: (event) => this.onKeyDown(event),
+      onFocus: () => this.onListFocus(),
       onContextMenu: (event) => {
         event.preventDefault();
         this.showContextMenu({ kind: "directory", name: "Root", path: "" }, event.clientX, event.clientY);
@@ -198,11 +225,24 @@ export class FilesPanelApp {
     });
     this.wrap.appendChild(this.list);
 
+    this.openTabs.start();
+
+    // Take keyboard focus whenever Muxy hands this panel focus (e.g. after the
+    // toggle-files shortcut) so arrow keys work without a click first.
+    this.handleWindowFocus = () => this.focusList();
+    window.addEventListener("focus", this.handleWindowFocus);
+
     document.addEventListener("contextmenu", this.preventNativeContextMenu);
     this.disposers.push(
+      () => this.openTabs.dispose(),
       this.gitStatus.subscribe(() => this.onGitStatusChange()),
       muxy.events.subscribe("worktree.switched", () => void this.loadRoot()),
       muxy.events.subscribe("project.switched", () => void this.loadRoot()),
+      // When our panel is (re)opened, pull keyboard focus into the tree so it's
+      // navigable immediately without a click.
+      muxy.events.subscribe("panel.opened", (payload) => {
+        if (panel_id_of(payload) === "files") requestAnimationFrame(() => this.focusList());
+      }),
       muxy.events.subscribe("file.changed", (payload) => {
         this.scheduleReconcile(payload);
         this.gitStatus.scheduleRefresh(RECONCILE_DEBOUNCE_MS);
@@ -219,6 +259,7 @@ export class FilesPanelApp {
       }),
       () => this.gitStatus.dispose(),
       () => document.removeEventListener("contextmenu", this.preventNativeContextMenu),
+      () => window.removeEventListener("focus", this.handleWindowFocus),
     );
 
     void this.loadRoot();
@@ -235,6 +276,7 @@ export class FilesPanelApp {
     for (const dispose of this.disposers) dispose?.();
     this.disposers = [];
     if (this.reconcileTimer !== null) clearTimeout(this.reconcileTimer);
+    if (this.typeahead.timer !== null) clearTimeout(this.typeahead.timer);
   }
 
   recordChildren(dirRel, entries) {
@@ -275,6 +317,7 @@ export class FilesPanelApp {
     this.expandedDirs.clear();
     this.selectedPath = null;
     this.closeContextMenu();
+    this.worktreeRoot = await this.resolveRoot();
     try {
       const entries = await muxy.files.list("");
       this.recordChildren("", entries);
@@ -290,19 +333,15 @@ export class FilesPanelApp {
     }
     await this.restoreMemory();
     this.render();
+    this.maybeInitialFocus();
     void this.gitStatus.refresh();
   }
 
-  // Re-applies the saved expanded dirs and selection for the active worktree.
-  // Expanded dirs are restored shallow-to-deep so each parent is loaded before
-  // its children are looked up; entries that no longer exist are skipped.
   async restoreMemory() {
     const { expanded, selected } = await load_tree_memory();
     const ordered = expanded.slice().sort((a, b) => depth_of(a) - depth_of(b));
     for (const dir of ordered) {
       const parent = parent_dir(dir);
-      // The parent must be loaded and itself expanded (or root) for this dir to
-      // be a real, reachable node; otherwise drop it from restoration.
       if (parent !== "" && !this.expandedDirs.has(parent)) continue;
       await this.ensureLoaded(parent);
       if (!this.entries.has(dir)) continue;
@@ -312,8 +351,6 @@ export class FilesPanelApp {
     if (selected && this.entries.has(selected)) this.selectedPath = selected;
   }
 
-  // Snapshots the current view for the active worktree. Best-effort and async;
-  // callers fire-and-forget after a state change.
   persistMemory() {
     void save_tree_memory(this.expandedDirs, this.selectedPath);
   }
@@ -405,9 +442,12 @@ export class FilesPanelApp {
     if (!this.list) return;
     this.renderFilterBar();
     this.list.replaceChildren();
+    this.visiblePaths = [];
+    this.rowElements = new Map();
     const rootChildren = this.children.get("") ?? [];
     if (rootChildren.length === 0) {
       this.list.appendChild(h("div", { class: "files-status" }, "No files"));
+      this.syncActiveDescendant();
       return;
     }
     if (this.dirtyFilter) {
@@ -415,14 +455,17 @@ export class FilesPanelApp {
       if (visible.length === 0) {
         const message = this.gitStatus.available ? "No changed files" : "No git changes";
         this.list.appendChild(h("div", { class: "files-status" }, message));
+        this.syncActiveDescendant();
         return;
       }
       for (const path of visible) this.renderRow(path, 0);
       this.focusRenameInput();
+      this.syncActiveDescendant();
       return;
     }
     for (const path of rootChildren) this.renderRow(path, 0);
     this.focusRenameInput();
+    this.syncActiveDescendant();
   }
 
   renderRow(path, depth) {
@@ -450,7 +493,9 @@ export class FilesPanelApp {
         dataset: { path, type: "item", itemType: directory ? "directory" : "file", itemPath: path },
         onClick: (event) => {
           event.stopPropagation();
-          if (!renaming) void this.activatePath(path);
+          if (renaming) return;
+          void this.activatePath(path);
+          this.list?.focus({ preventScroll: true });
         },
         onContextMenu: (event) => {
           event.preventDefault();
@@ -458,7 +503,18 @@ export class FilesPanelApp {
           this.showContextMenu({ kind: entry.kind, name: basename(path), path }, event.clientX, event.clientY);
         },
         onDragStart: (event) => {
-          event.dataTransfer?.setData("text/plain", path);
+          if (!event.dataTransfer) return;
+          // Internal moves read this relative path back in dropPaths().
+          event.dataTransfer.setData("application/x-muxy-path", path);
+          // External drops (terminal, chat) need an absolute file:// URI —
+          // Muxy's DroppedPathsParser rejects bare relative paths.
+          const abs = this.abs_path(path);
+          if (abs) {
+            event.dataTransfer.setData("text/uri-list", this.file_url(abs));
+            event.dataTransfer.setData("text/plain", abs);
+          } else {
+            event.dataTransfer.setData("text/plain", path);
+          }
         },
         onDragOver: (event) => {
           if (!directory) return;
@@ -482,7 +538,9 @@ export class FilesPanelApp {
               "aria-label": expanded ? "Collapse folder" : "Expand folder",
               onClick: (event) => {
                 event.stopPropagation();
+                this.selectedPath = path;
                 void this.toggleDirectory(path);
+                this.list?.focus({ preventScroll: true });
               },
             },
             chevron_icon(expanded),
@@ -494,6 +552,9 @@ export class FilesPanelApp {
         ? h("span", { class: "file-tree-git-mark", title: GIT_STATUS_LABEL[gitStatus] }, GIT_STATUS_GLYPH[gitStatus])
         : null,
     );
+    row.id = `ft-row-${this.visiblePaths.length}`;
+    this.rowElements.set(path, row);
+    this.visiblePaths.push(path);
     this.list.appendChild(row);
 
     if (directory && expanded) {
@@ -544,7 +605,7 @@ export class FilesPanelApp {
     }
     this.render();
     this.persistMemory();
-    void open_in_editor(path);
+    void this.openFile(path);
   }
 
   async toggleDirectory(path) {
@@ -558,6 +619,183 @@ export class FilesPanelApp {
     await this.ensureLoaded(path);
     this.render();
     this.persistMemory();
+  }
+
+  // ---- Keyboard navigation -------------------------------------------------
+
+  syncActiveDescendant() {
+    if (!this.list) return;
+    const el = this.selectedPath ? this.rowElements.get(this.selectedPath) : null;
+    if (el) this.list.setAttribute("aria-activedescendant", el.id);
+    else this.list.removeAttribute("aria-activedescendant");
+  }
+
+  // Move the highlighted row without rebuilding the tree — just swap the
+  // selected classes on the two affected rows and update the aria pointer.
+  moveSelection(path, { reveal = true } = {}) {
+    if (!path || !this.rowElements.has(path)) return;
+    const previous = this.selectedPath;
+    if (previous && previous !== path) {
+      const prevEl = this.rowElements.get(previous);
+      if (prevEl) {
+        prevEl.classList.remove("file-tree-row-selected");
+        prevEl.setAttribute("aria-selected", "false");
+      }
+    }
+    this.selectedPath = path;
+    const el = this.rowElements.get(path);
+    el.classList.add("file-tree-row-selected");
+    el.setAttribute("aria-selected", "true");
+    if (reveal) el.scrollIntoView({ block: "nearest" });
+    this.syncActiveDescendant();
+    this.persistMemory();
+  }
+
+  focusList() {
+    if (!this.list || this.renameState) return;
+    // Don't steal focus from a field the user is typing in (e.g. a rename).
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== this.list &&
+      (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)
+    ) {
+      return;
+    }
+    try {
+      this.list.focus({ preventScroll: true });
+    } catch {
+      /* focus can throw if the element is detached; ignore */
+    }
+  }
+
+  maybeInitialFocus() {
+    if (this.didInitialFocus) return;
+    this.didInitialFocus = true;
+    this.focusList();
+  }
+
+  // When the tree gains focus with nothing selected, highlight the first row
+  // so arrow keys have a starting point.
+  onListFocus() {
+    if (this.selectedPath && this.rowElements.has(this.selectedPath)) return;
+    if (this.visiblePaths.length > 0) this.moveSelection(this.visiblePaths[0], { reveal: false });
+  }
+
+  onKeyDown(event) {
+    // Rename input and context menu own their own keys.
+    if (this.renameState || this.contextMenu) return;
+    // Leave app-level shortcuts (cmd/ctrl/alt combos) to Muxy.
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+    const paths = this.visiblePaths;
+    if (paths.length === 0) return;
+    const idx = this.selectedPath ? paths.indexOf(this.selectedPath) : -1;
+
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        this.moveSelection(paths[idx < 0 ? 0 : Math.min(idx + 1, paths.length - 1)]);
+        return;
+      case "ArrowUp":
+        event.preventDefault();
+        this.moveSelection(paths[idx < 0 ? paths.length - 1 : Math.max(idx - 1, 0)]);
+        return;
+      case "ArrowRight":
+        event.preventDefault();
+        this.navigateRight(idx);
+        return;
+      case "ArrowLeft":
+        event.preventDefault();
+        this.navigateLeft(idx);
+        return;
+      case "Home":
+        event.preventDefault();
+        this.moveSelection(paths[0]);
+        return;
+      case "End":
+        event.preventDefault();
+        this.moveSelection(paths[paths.length - 1]);
+        return;
+      case "Enter":
+      case " ":
+        if (idx < 0) return;
+        event.preventDefault();
+        void this.activatePath(paths[idx]);
+        return;
+      case "F2":
+        if (idx < 0 || paths[idx] === "") return;
+        event.preventDefault();
+        this.startRename(paths[idx]);
+        return;
+      case "Escape":
+        return;
+      default:
+        this.handleTypeahead(event);
+    }
+  }
+
+  navigateRight(idx) {
+    const paths = this.visiblePaths;
+    if (idx < 0) {
+      this.moveSelection(paths[0]);
+      return;
+    }
+    const path = paths[idx];
+    const entry = this.entries.get(path);
+    if (!entry || entry.kind !== "directory") return;
+    const expanded = this.dirtyFilter || this.expandedDirs.has(path);
+    if (!expanded) {
+      this.selectedPath = path;
+      void this.toggleDirectory(path);
+      return;
+    }
+    // Already open: step into the first child if the folder has visible ones.
+    const next = paths[idx + 1];
+    if (next && depth_of(next) > depth_of(path)) this.moveSelection(next);
+  }
+
+  navigateLeft(idx) {
+    const paths = this.visiblePaths;
+    if (idx < 0) {
+      this.moveSelection(paths[0]);
+      return;
+    }
+    const path = paths[idx];
+    const entry = this.entries.get(path);
+    const expanded = entry?.kind === "directory" && (this.dirtyFilter || this.expandedDirs.has(path));
+    if (expanded && !this.dirtyFilter) {
+      this.selectedPath = path;
+      void this.toggleDirectory(path);
+      return;
+    }
+    // Otherwise jump to the parent folder when it's visible in the tree.
+    const parent = parent_dir(path);
+    if (parent && this.rowElements.has(parent)) this.moveSelection(parent);
+  }
+
+  handleTypeahead(event) {
+    const ch = event.key;
+    if (ch.length !== 1 || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!/\S/.test(ch)) return;
+    event.preventDefault();
+    if (this.typeahead.timer !== null) clearTimeout(this.typeahead.timer);
+    this.typeahead.buffer += ch.toLowerCase();
+    this.typeahead.timer = setTimeout(() => {
+      this.typeahead.buffer = "";
+      this.typeahead.timer = null;
+    }, 600);
+
+    const paths = this.visiblePaths;
+    const start = this.selectedPath ? paths.indexOf(this.selectedPath) : -1;
+    const buffer = this.typeahead.buffer;
+    for (let i = 1; i <= paths.length; i += 1) {
+      const candidate = paths[(start + i) % paths.length];
+      if (basename(candidate).toLowerCase().startsWith(buffer)) {
+        this.moveSelection(candidate);
+        return;
+      }
+    }
   }
 
   async createFile(parentRel) {
@@ -640,10 +878,32 @@ export class FilesPanelApp {
     this.render();
   }
 
+  async resolveRoot() {
+    // muxy.exec defaults its cwd to the active worktree root — the same root
+    // muxy.files paths are relative to — so `pwd` yields the absolute base
+    // without needing the worktrees:read permission.
+    try {
+      const res = await muxy.exec(["pwd"]);
+      if (res?.exitCode === 0) return res.stdout.trim() || null;
+    } catch {
+      /* fall through */
+    }
+    return null;
+  }
+
+  abs_path(rel) {
+    if (!this.worktreeRoot) return null;
+    return `${this.worktreeRoot.replace(/\/+$/, "")}/${strip_slash(rel)}`;
+  }
+
+  file_url(abs) {
+    return `file://${abs.split("/").map(encodeURIComponent).join("/")}`;
+  }
+
   async dropPaths(event, targetDirRel) {
     event.preventDefault();
     event.stopPropagation();
-    const dragged = event.dataTransfer?.getData("text/plain");
+    const dragged = event.dataTransfer?.getData("application/x-muxy-path");
     this.dropTarget = null;
     if (!dragged) return;
     const target = canonical_dir(targetDirRel);

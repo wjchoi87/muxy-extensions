@@ -1,7 +1,34 @@
-import { has_dirty_replaceable_editor_for_other_file } from "@/lib/editor-state";
+async function focus_tab(tabId) {
+  if (!tabId) return false;
+  try {
+    await muxy.tabs.switchTo(tabId);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function strip_slash(path) {
   return path.replace(/\/+$/, "");
+}
+
+function path_segments(path) {
+  return String(path ?? "")
+    .replace(/\/+$/, "")
+    .split("/")
+    .filter(Boolean);
+}
+
+export function same_file(changedPath, filePath) {
+  const want = path_segments(filePath);
+  if (want.length === 0) return false;
+  const got = path_segments(changedPath);
+  if (got.length < want.length) return false;
+  const offset = got.length - want.length;
+  for (let i = 0; i < want.length; i += 1) {
+    if (got[offset + i] !== want[i]) return false;
+  }
+  return true;
 }
 
 export function canonical_dir(rel) {
@@ -87,16 +114,15 @@ export async function try_action(action, error_title) {
   }
 }
 
-export async function open_in_editor(rel) {
+export async function open_in_editor(rel, focusTabId = null) {
   try {
-    const singleton = !has_dirty_replaceable_editor_for_other_file(rel);
+    if (focusTabId && (await focus_tab(focusTabId))) return;
     await muxy.tabs.open({
       kind: "extensionWebView",
       extension: {
         id: muxy.extensionID,
         tabType: "code-editor",
-        singleton,
-        data: { filePath: rel, replaceable: singleton },
+        data: { filePath: rel, replaceable: false },
       },
     });
   } catch (err) {
@@ -120,6 +146,17 @@ export async function open_in_new_tab(rel) {
     await muxy
       .toast({ title: "Open file", body: error_message(err), variant: "error" })
       .catch(() => undefined);
+  }
+}
+
+export async function is_internal_file(rel) {
+  const path = strip_slash(rel);
+  if (!path) return false;
+  try {
+    const stat = await muxy.files.stat(path);
+    return Boolean(stat) && !stat.isDirectory;
+  } catch {
+    return false;
   }
 }
 

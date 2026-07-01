@@ -1,4 +1,4 @@
-import { basename, error_message, open_externally, reveal_in_finder, try_action } from "@/lib/files";
+import { basename, error_message, open_externally, reveal_in_finder, same_file, try_action } from "@/lib/files";
 import { is_image, is_markdown, is_svg } from "@/lib/languages";
 import { icon_for } from "@/lib/file-icon";
 import { CodeEditor } from "@/editor/code-editor";
@@ -8,6 +8,7 @@ import { FindInFilesView } from "@/editor/find-in-files";
 import { SettingsSheet } from "@/editor/settings-sheet";
 import { OpenIcon, RevealIcon, SaveIcon, SettingsIcon } from "@/editor/icons";
 import {
+  AUTO_SAVE_DELAY_MS,
   load_editor_config,
   subscribe_editor_config,
   update_editor_config,
@@ -18,6 +19,8 @@ import {
   write_editor_state,
 } from "@/lib/editor-state";
 import { clear, cls, h } from "@/lib/dom";
+
+const RELOAD_DEBOUNCE_MS = 250;
 
 function read_data() {
   return window.muxy?.data ?? {};
@@ -53,6 +56,10 @@ export class EditorApp {
     this.settingsSheet = null;
     this.tabFocused = document.hasFocus();
     this.pendingFocusRaf = 0;
+    this.reloadTimer = 0;
+    this.conflictPending = false;
+    this.autoSaveTimer = 0;
+    this.lastWritten = null;
   }
 
   start() {
@@ -87,7 +94,9 @@ export class EditorApp {
         this.config = config;
         this.child?.updateConfig?.(this.config, this.isDark);
         this.settingsSheet?.setConfig(this.config);
+        this.syncAutoSave();
       }),
+      muxy.events.subscribe("file.changed", (payload) => this.onFileChanged(payload)),
       muxy.events.subscribe("command.files-save", () => {
         if (!document.hasFocus()) return;
         void this.save();
@@ -169,6 +178,8 @@ export class EditorApp {
 
   dispose() {
     if (this.pendingFocusRaf) cancelAnimationFrame(this.pendingFocusRaf);
+    if (this.reloadTimer) window.clearTimeout(this.reloadTimer);
+    this.cancelAutoSave();
     this.destroyChild();
     this.destroySettings();
     for (const dispose of this.disposers) dispose?.();
@@ -203,6 +214,15 @@ export class EditorApp {
     const filePath = this.filePath;
     this.updateTabChrome();
 
+    // Switching/reloading the target supersedes any pending external-change work.
+    if (this.reloadTimer) {
+      window.clearTimeout(this.reloadTimer);
+      this.reloadTimer = 0;
+    }
+    this.cancelAutoSave();
+    this.conflictPending = false;
+    this.lastWritten = null;
+
     if (!filePath) {
       this.fileLoadId += 1;
       this.content = null;
@@ -222,9 +242,6 @@ export class EditorApp {
     this.setDirty(false);
     this.render();
 
-    // Raster images are binary, so skip the UTF-8 text read entirely; the image
-    // viewer pulls the bytes in itself. `content` is set to an empty string so
-    // renderBody treats the file as ready (it only branches to the viewer).
     if (this.isImage()) {
       this.content = "";
       this.error = null;
@@ -255,6 +272,96 @@ export class EditorApp {
         }
       }
     }
+  }
+
+  onFileChanged(payload) {
+    const filePath = this.filePath;
+    if (!filePath) return;
+    const changed = payload && typeof payload === "object" && "path" in payload ? payload.path : undefined;
+    if (typeof changed !== "string" || !same_file(changed, filePath)) return;
+    // Skip while loading or mid-save: those go through loadTarget()/save(),
+    // which already sync this.content with the freshest value.
+    if (this.loading || this.saving) return;
+    // A conflict prompt is open — don't queue another reload behind it.
+    if (this.conflictPending) return;
+    if (this.reloadTimer) return;
+    this.reloadTimer = window.setTimeout(() => {
+      this.reloadTimer = 0;
+      void this.reloadFromDisk(filePath);
+    }, RELOAD_DEBOUNCE_MS);
+  }
+
+  async reloadFromDisk(filePath) {
+    if (this.filePath !== filePath) return;
+    if (this.loading || this.saving) return;
+    // A conflict prompt for this file is already open — let the user resolve it first.
+    if (this.conflictPending) return;
+
+    if (this.isImage()) {
+      // Re-mount the viewer so the <img> re-fetches the changed bytes.
+      this.bodyKey = null;
+      this.render();
+      return;
+    }
+
+    let next;
+    try {
+      const file = await muxy.files.read(filePath);
+      next = file.content;
+    } catch {
+      return;
+    }
+    if (this.filePath !== filePath || this.saving || this.conflictPending) return;
+
+    if (next === this.lastWritten) {
+      this.content = next;
+      return;
+    }
+
+    if (!this.dirty) {
+      // Clean buffer: silently adopt the new bytes. Ignore no-op events (e.g. our own save).
+      if (next === this.content) return;
+      this.applyDiskContent(next);
+      return;
+    }
+
+    // Unsaved edits exist. Compare against the live buffer, not this.content
+    // (which still holds the value the file was opened with).
+    const buffer = this.child?.getValue ? this.child.getValue() : this.content;
+    if (next === buffer) return; // Disk matches what the user has — no real conflict.
+
+    void this.promptConflict(filePath, next);
+  }
+
+  applyDiskContent(next) {
+    this.content = next;
+    this.error = null;
+    this.bodyKey = null;
+    this.setDirty(false);
+    this.render();
+  }
+
+  async promptConflict(filePath, diskContent) {
+    this.conflictPending = true;
+    const name = basename(filePath);
+    let choice;
+    try {
+      choice = await muxy.dialog.confirm({
+        title: "File changed on disk",
+        message: `${name} was modified outside the editor and you have unsaved changes. Reload from disk and discard your edits, or keep editing?`,
+        buttons: ["Reload", "Keep My Changes"],
+        default: "Keep My Changes",
+        cancel: "Keep My Changes",
+        style: "warning",
+      });
+    } catch {
+      choice = null;
+    } finally {
+      this.conflictPending = false;
+    }
+    // The user may have switched files or saved while the dialog was open.
+    if (this.filePath !== filePath || this.saving) return;
+    if (choice === "Reload") this.applyDiskContent(diskContent);
   }
 
   updateTabChrome() {
@@ -289,14 +396,38 @@ export class EditorApp {
   markDirty() {
     if (this.dirty) {
       this.publishEditorState(true);
-      return;
+    } else {
+      this.setDirty(true);
     }
-    this.setDirty(true);
+    this.scheduleAutoSave();
+  }
+
+  scheduleAutoSave() {
+    if (this.autoSaveTimer) {
+      window.clearTimeout(this.autoSaveTimer);
+      this.autoSaveTimer = 0;
+    }
+    if (this.config.autoSave === false) return;
+    if (!this.filePath || this.isImage()) return;
+    this.autoSaveTimer = window.setTimeout(() => {
+      this.autoSaveTimer = 0;
+      // Re-check at fire time: the buffer may be clean again, or a save/conflict in flight.
+      if (!this.dirty || this.saving || this.conflictPending) return;
+      void this.save();
+    }, AUTO_SAVE_DELAY_MS);
+  }
+
+  cancelAutoSave() {
+    if (this.autoSaveTimer) {
+      window.clearTimeout(this.autoSaveTimer);
+      this.autoSaveTimer = 0;
+    }
   }
 
   async save() {
     if (!this.filePath || !this.child || this.saving) return false;
     if (typeof this.child.getValue !== "function") return false;
+    this.cancelAutoSave();
     const next = this.child.getValue();
     this.saving = true;
     this.updateTopbar();
@@ -304,6 +435,7 @@ export class EditorApp {
     this.saving = false;
     if (ok) {
       this.content = next;
+      this.lastWritten = next;
       this.setDirty(false);
     }
     this.updateTopbar();
@@ -312,6 +444,11 @@ export class EditorApp {
 
   async confirmClose() {
     if (!this.dirty) return false;
+    // With auto save on, just flush silently instead of prompting on close.
+    if (this.config.autoSave !== false && this.filePath && !this.isImage()) {
+      const ok = await this.save();
+      return !ok; // Block the close only if the save failed.
+    }
     const name = this.filePath ? basename(this.filePath) : "This file";
     const choice = await muxy.dialog.confirm({
       title: "Unsaved changes",
@@ -339,7 +476,6 @@ export class EditorApp {
 
   setSvgView(view) {
     if (this.svgView === view) return;
-    // Preserve in-editor edits so toggling to View renders the latest source.
     if (this.child?.getValue) this.content = this.child.getValue();
     this.svgView = view;
     this.bodyKey = null;
@@ -350,6 +486,16 @@ export class EditorApp {
     this.config = update_editor_config(this.config, patch);
     this.child?.updateConfig?.(this.config, this.isDark);
     this.settingsSheet?.setConfig(this.config);
+    this.syncAutoSave();
+  }
+
+  syncAutoSave() {
+    if (this.config.autoSave === false) {
+      this.cancelAutoSave();
+      return;
+    }
+    // Turned on (or already on) with pending edits — make sure a save is scheduled.
+    if (this.dirty && !this.autoSaveTimer) this.scheduleAutoSave();
   }
 
   render() {
@@ -463,7 +609,6 @@ export class EditorApp {
       actions.appendChild(h("span", { class: "toolbar-divider" }));
     }
 
-    // Raster images can't be edited here, so they drop Save and editor Settings.
     if (!image) {
       actions.append(
         h(
@@ -597,6 +742,8 @@ export class EditorApp {
       return;
     }
     if (markdown) {
+      const initialPosition = this.initialPosition();
+      if (initialPosition) this.mdMode = "edit";
       this.child = new MarkdownEditor({
         parent: this.body,
         filePath: this.filePath,
@@ -604,6 +751,7 @@ export class EditorApp {
         isDark: this.isDark,
         config: this.config,
         mode: this.mdMode,
+        initialPosition,
         onDirty: () => this.markDirty(),
         onSave: () => this.save(),
       });
@@ -617,10 +765,21 @@ export class EditorApp {
       value: this.content,
       isDark: this.isDark,
       config: this.config,
+      initialPosition: this.initialPosition(),
       onDirty: () => this.markDirty(),
       onSave: () => this.save(),
     });
     this.focusEditor();
+  }
+
+  initialPosition() {
+    const line = Number(this.data.line);
+    if (!Number.isInteger(line) || line < 1) return null;
+    const column = Number(this.data.column);
+    return {
+      line,
+      column: Number.isInteger(column) && column >= 1 ? column : 1,
+    };
   }
 
   focusEditor() {
