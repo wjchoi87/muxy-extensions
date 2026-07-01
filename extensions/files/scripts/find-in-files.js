@@ -1,18 +1,16 @@
 const MAX_RESULTS = 2000;
 const MAX_TEXT_LEN = 200;
-const TMP_DIR = ".muxy";
-const TMP_FILE = `${TMP_DIR}/muxy-search`;
 
 function ext_id() {
   return (typeof muxy !== "undefined" && muxy.extensionID) || "files";
 }
 
-function rg_args(tmp_file, options) {
+function rg_args(query, options) {
   const args = ["rg", "-n", "--no-config", "--color", "never"];
   if (!options.regex) args.push("-F");
   if (!options.caseSensitive) args.push("-i");
   if (options.wholeWord) args.push("-w");
-  args.push("-f", tmp_file, ".");
+  args.push("-e", query, ".");
   return args;
 }
 
@@ -52,26 +50,11 @@ function parse_choice(id) {
 }
 
 function run_search(query, options) {
-  let use_rg = false;
-  try {
-    muxy.files.mkdir(TMP_DIR);
-    muxy.files.write(TMP_FILE, query);
-    use_rg = true;
-  } catch {
-    use_rg = false;
-  }
-
   let result = null;
-  if (use_rg) {
-    try {
-      result = muxy.exec(rg_args(TMP_FILE, options));
-    } catch {
-      result = null;
-    } finally {
-      try {
-        muxy.files.delete(TMP_FILE);
-      } catch {}
-    }
+  try {
+    result = muxy.exec(rg_args(query, options));
+  } catch {
+    result = null;
   }
 
   if (!result || result.exitCode > 1) {
