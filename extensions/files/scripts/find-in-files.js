@@ -38,9 +38,17 @@ function parse_line(line) {
     id: `${file_path}:${line_num}`,
     title: text.trim() || " ",
     subtitle: `${file_path}:${line_num}`,
-    filePath: file_path,
-    lineNum: line_num,
   };
+}
+
+function parse_choice(id) {
+  if (typeof id !== "string") return null;
+  const sep = id.lastIndexOf(":");
+  if (sep < 0) return null;
+  const file_path = id.slice(0, sep);
+  const line_num = parseInt(id.slice(sep + 1), 10);
+  if (!file_path || !Number.isFinite(line_num)) return null;
+  return { filePath: file_path, lineNum: line_num };
 }
 
 function run_search(query, options) {
@@ -105,6 +113,8 @@ muxy.modal.open({
   },
   onSelect(choice) {
     if (!choice) return;
+    const target = parse_choice(choice.id);
+    if (!target) return;
     try {
       muxy.tabs.open({
         kind: "extensionWebView",
@@ -112,14 +122,14 @@ muxy.modal.open({
           id: ext_id(),
           tabType: "code-editor",
           singleton: false,
-          data: { filePath: choice.filePath, line: choice.lineNum, replaceable: false },
+          data: { filePath: target.filePath, line: target.lineNum, replaceable: false },
         },
       });
     } catch (err) {
       console.error(
         "[find-in-files] tabs.open FAILED" +
-          " file=" + String(choice.filePath) +
-          " line=" + String(choice.lineNum) +
+          " file=" + String(target.filePath) +
+          " line=" + String(target.lineNum) +
           " error=" + String((err && err.message) || err),
       );
     }
